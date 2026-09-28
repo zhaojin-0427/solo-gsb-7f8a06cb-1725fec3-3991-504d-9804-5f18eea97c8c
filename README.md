@@ -43,11 +43,18 @@ failure），校验每个事件是否合法，忽略违规事件并给出每个�
 标签对，并给出每个缺失标签与每对冲突从目标到标签来源的最短依赖路径（详见
 下文对应章节）。
 
+`POST /provenance/verify` 面向**构建结果证明链核验**：提交与 `/plans` 相同
+的节点图、目标节点、闭包节点的签名证明（每节点至多一份）以及受信
+Ed25519 公钥表；服务按 `/plans` 规则重算闭包指纹，重算每份证明的 SHA-256
+证明摘要并用对应公钥验证 Ed25519 签名，逐节点核对指纹、直接依赖名、依赖
+证明摘要与签名；任一节点不过则 `trusted=false` 并给出按节点名排序的原因
+（详见下文对应章节）。
+
 ## 目录结构
 
 ```
 app/
-  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、GET /health
+  main.py       # FastAPI 入口：POST /plans、/impacts、/cache-retention、/execution-audits、/failure-isolation、/release-bundles、/release-transitions、/release-policies、/provenance/verify、GET /health
   models.py     # 请求/响应 Pydantic 模型
   planner.py    # 图校验、指纹、拓扑排序、缓存判定与批次划分（纯函数核心）
   impacts.py    # 两图对比、根因识别与最短传导路径分析（纯函数核心）
@@ -57,6 +64,7 @@ app/
   bundles.py    # 依赖一致的发布制品包精确选择（纯函数核心）
   transitions.py# 发布包之间最少步骤的逐节点制品切换规划（纯函数核心）
   policies.py   # 组织条款标签的发布判定（纯函数核心）
+  provenance.py # Ed25519 签名证明链的证明摘要重算与核验（纯函数核心）
 tests/
   test_planner.py
   test_impacts.py
@@ -66,6 +74,7 @@ tests/
   test_bundles.py
   test_transitions.py
   test_policies.py
+  test_provenance.py
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt
@@ -104,6 +113,16 @@ curl -s -X POST http://localhost:8000/release-transitions \
   -H 'Content-Type: application/json' \
   -d '{"nodes":[{"name":"a","content_digest":"a","dependency_names":[]}],"target":"a","artifacts":[{"id":"a1","node":"a","fingerprint":"f1","size":1,"dependencies":{}},{"id":"a2","node":"a","fingerprint":"f2","size":1,"dependencies":{}}],"current_ids":["a1"],"next_ids":["a2"]}'
 # {"possible":true,"steps":[{"node":"a","id":"a2","bundle":{"a":"a2"}}]}
+```
+
+8000 端口上的证明链核验示例（公钥与签名均为 Base64，完整字段说明见下文
+`POST /provenance/verify` 章节）：
+
+```bash
+curl -s -X POST http://localhost:8000/provenance/verify \
+  -H 'Content-Type: application/json' \
+  -d '{"nodes":[{"name":"core","content_digest":"core-src-v1","dependency_names":[]},{"name":"util","content_digest":"util-src-v1","dependency_names":["core"]},{"name":"web","content_digest":"web-src-v1","dependency_names":["util"]}],"target":"web","attestations":[{"node":"core","fingerprint":"b53b764e740673cd4449f872a6cdea0998cbd5d92d2d706820ec010a56e0a714","signer":"ci-builder-1","dependency_digests":{},"signature":"o9PpmvjNmMu+tXpnM33ifv0l6k2J1GmSAd4Py1SXkHRayf5BgGFVh0cwqtmPRFtmqufO+K1Llycyrwkfaq3iDQ=="},{"node":"util","fingerprint":"30c69063e340908c43750e92d696cc9410c09814fef4510c05829ceadc7ca3b8","signer":"ci-builder-1","dependency_digests":{"core":"0431784fe30b681b24ddadd8c380676bfff3e2e1da14d69d528d378c967ce0ec"},"signature":"y5J0ykU1EW1kePlhUC4/AFLQ3+ctMW8D48tUz+cxyeupp6h5OjKxbUMkq8qr8pY7vw4KaZSOj7hqjKtM56HBBg=="},{"node":"web","fingerprint":"1f93bd77976373186e6928e104c2e7af424759857f14218ce19cb8c3b0158396","signer":"ci-builder-1","dependency_digests":{"util":"0380bf86cd1d93a888e04d727b16b931f8c4bb177f3b0a895a28c4cf56c4a9c4"},"signature":"/ZmdFSHRA3pm4s/FERRQ/R4vwBnVKyc7+H/cgJrRkzyr5vvwCa8RaTiklXkJEnTLSYWgyTgz20be6SOCTby8AA=="}],"trusted_keys":{"ci-builder-1":"A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="}}'
+# {"trusted":true,"reasons":[]}
 ```
 
 ## 请求示例
@@ -1033,6 +1052,147 @@ curl -s -X POST http://localhost:8000/release-policies \
 }
 ```
 
+## POST /provenance/verify：构建结果证明链核验
+
+发布前，`POST /provenance/verify` 对目标节点依赖闭包中的**构建结果证明链**
+做加密核验。请求包含：
+
+- `nodes`：节点图（字段与 `/plans` 完全相同）；
+- `target`：目标节点名（必须在图中），只核验其传递依赖闭包（目标自身总在
+  闭包内），闭包外节点不得附带证明；
+- `attestations`：签名证明列表，闭包中每节点**至多一份**，且不得为闭包外
+  节点提供；每份证明含：
+  - `node`：被证明的节点名；
+  - `fingerprint`：签署时记录的节点指纹；
+  - `signer`：签署者 ID（必须出现在 `trusted_keys` 中）；
+  - `dependency_digests`：**直接依赖名 → 该依赖证明摘要**的映射，键必须与
+    节点的直接依赖逐一对应；
+  - `signature`：对证明规范字节的 Ed25519 签名，**Base64 编码**；
+- `trusted_keys`：**受信签署者 ID → Ed25519 公钥** 的映射，公钥为 Base64
+  编码（解码后恰好 32 字节）。
+
+服务先按 `/plans` 的规则重算闭包中每个节点的指纹，再对每份证明计算**证明
+摘要**。摘要的输入是如下四元组的规范 JSON：
+
+```
+attestation_bytes = canonical_json([
+    节点名,
+    指纹,
+    签署者 ID,
+    [[依赖名, 依赖证明摘要] for 依赖名 in sorted(直接依赖)]
+])
+证明摘要 = SHA-256(attestation_bytes) 的小写十六进制
+```
+
+规范 JSON 为紧凑形式（无空白）、**不转义非 ASCII**（`ensure_ascii=False`）
+并编码为 UTF-8；依赖对按依赖名排序。Ed25519 签名恰好覆盖这些 UTF-8 字节。
+
+逐节点核验（按拓扑序进行，每个节点只报首个不符项）：
+
+1. 闭包节点必须恰好有一份证明——缺失记 `missing_attestation`；
+2. 证明中的指纹必须等于重算指纹，否则 `fingerprint_mismatch`；
+3. 对证明中列出的每个直接依赖：该依赖自身的证明必须通过，且声明的依赖
+   摘要必须等于依赖证明的重算摘要；依赖证明缺失、依赖自身未通过或摘要
+   不等均记 `digest_mismatch`；
+4. `dependency_digests` 的键集合必须与直接依赖完全一致；在第 3 步全部
+   通过的前提下若仍有多余/缺失的键，记 `dependency_mismatch`；
+5. 签署者必须在受信公钥表中，否则 `unknown_signer`；
+6. 用该签署者的公钥对证明字节验签，失败记 `invalid_signature`（签名 Base64
+   合法但长度不是 64 字节也按验签失败处理）。
+
+**失败沿依赖链传播**：依赖未通过时，引用其摘要的节点无法通过第 3 步，记
+`digest_mismatch`。只有闭包内**每个**节点都通过时 `trusted` 才为 `true`；
+否则 `trusted=false`，`reasons` 列出每个未通过节点的一项原因，**按节点名
+排序**。请求中节点、证明与公钥表的书写顺序均不影响结果。
+
+错误（均为 HTTP `400`，属于请求本身的问题）：
+
+- `unknown_target`：目标不在图中；
+- `duplicate_attestation`：同一节点提供了多份证明（`details.nodes` 按名称
+  排序）；
+- `unknown_attestation_node`：证明引用了图中不存在的节点；
+- `attestation_outside_closure`：证明覆盖了目标闭包之外的节点
+  （`details.names` 按名称排序）；
+- `invalid_encoding`：签名或公钥不是合法 Base64（`details.nodes` 或
+  `details.signers` 按名称排序）；
+- `invalid_public_key`：公钥解码后不是 32 字节（`details.keys` 列出签署者与
+  实际字节长度）；
+- 图本身的 `duplicate_node`、`missing_dependency`、`cycle_detected` 校验与
+  `/plans` 一致。
+
+字段缺失/类型错误、空字符串、未知字段等由 Pydantic 拒绝（HTTP `422`）。
+
+### 调用示例
+
+下图 `web → util → core`，三份证明均由签署者 `ci-builder-1` 用其 Ed25519
+私钥对规范字节签名，公钥列在 `trusted_keys` 中（下面的指纹、摘要、签名与
+公钥均为真实数据，可直接复现）：
+
+```bash
+curl -s -X POST http://localhost:8000/provenance/verify \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "nodes": [
+      {"name": "core", "content_digest": "core-src-v1", "dependency_names": []},
+      {"name": "util", "content_digest": "util-src-v1", "dependency_names": ["core"]},
+      {"name": "web",  "content_digest": "web-src-v1",  "dependency_names": ["util"]}
+    ],
+    "target": "web",
+    "attestations": [
+      {"node": "core", "fingerprint": "b53b764e740673cd4449f872a6cdea0998cbd5d92d2d706820ec010a56e0a714",
+       "signer": "ci-builder-1", "dependency_digests": {},
+       "signature": "o9PpmvjNmMu+tXpnM33ifv0l6k2J1GmSAd4Py1SXkHRayf5BgGFVh0cwqtmPRFtmqufO+K1Llycyrwkfaq3iDQ=="},
+      {"node": "util", "fingerprint": "30c69063e340908c43750e92d696cc9410c09814fef4510c05829ceadc7ca3b8",
+       "signer": "ci-builder-1",
+       "dependency_digests": {"core": "0431784fe30b681b24ddadd8c380676bfff3e2e1da14d69d528d378c967ce0ec"},
+       "signature": "y5J0ykU1EW1kePlhUC4/AFLQ3+ctMW8D48tUz+cxyeupp6h5OjKxbUMkq8qr8pY7vw4KaZSOj7hqjKtM56HBBg=="},
+      {"node": "web", "fingerprint": "1f93bd77976373186e6928e104c2e7af424759857f14218ce19cb8c3b0158396",
+       "signer": "ci-builder-1",
+       "dependency_digests": {"util": "0380bf86cd1d93a888e04d727b16b931f8c4bb177f3b0a895a28c4cf56c4a9c4"},
+       "signature": "/ZmdFSHRA3pm4s/FERRQ/R4vwBnVKyc7+H/cgJrRkzyr5vvwCa8RaTiklXkJEnTLSYWgyTgz20be6SOCTby8AA=="}
+    ],
+    "trusted_keys": {"ci-builder-1": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg="}
+  }'
+```
+
+响应（`200 OK`）：
+
+```json
+{"trusted": true, "reasons": []}
+```
+
+若不提供 `core` 的证明（闭包中缺少一份证明），响应（`200 OK`，原因按
+节点名排序）：
+
+```json
+{
+  "trusted": false,
+  "reasons": [
+    {"node": "core", "code": "missing_attestation"},
+    {"node": "util", "code": "digest_mismatch"},
+    {"node": "web",  "code": "digest_mismatch"}
+  ]
+}
+```
+
+解读：
+
+- `core` 没有证明（`missing_attestation`）；
+- `util` 声称的 `core` 证明摘要无处可核（`digest_mismatch`）；
+- `web` 引用的 `util` 证明自身未通过，失败继续向上传播
+  （`digest_mismatch`）。
+
+若为闭包外节点（例如对上图同时提供一份 `docs` 的证明）附带证明，则为
+HTTP `400`：
+
+```json
+{
+  "code": "attestation_outside_closure",
+  "message": "Attestations may only cover nodes in the target's dependency closure",
+  "details": {"names": ["docs"]}
+}
+```
+
 ## 指纹与批次的计算规则
 
 **指纹**（按拓扑序计算）：
@@ -1081,6 +1241,7 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 | POST   | `/release-bundles`    | 选择总大小最小的依赖一致发布制品包         |
 | POST   | `/release-transitions`| 规划两包间最少步骤的逐节点制品切换         |
 | POST   | `/release-policies`   | 沿 bundled 边闭包判定组织条款能否发布      |
+| POST   | `/provenance/verify`  | 重算指纹与证明摘要，Ed25519 核验闭包证明链 |
 
 `/plans` 请求体字段：
 
@@ -1177,6 +1338,25 @@ level(n) = 1 + max(level(d))  for d in deps(n) if d 未命中
 `path`）、`conflicts`（冲突列表，按标签对排序，每项含排序后的 `pair` 与
 两端各自的最短来源路径 `paths`）。
 
+`/provenance/verify` 请求体字段：
+
+| 字段                                          | 类型                             | 说明                                                |
+|-----------------------------------------------|----------------------------------|-----------------------------------------------------|
+| `nodes`                                       | Node[]                           | 节点图（字段同 `/plans`）                           |
+| `target`                                      | string（非空）                   | 目标节点，必须在图中；只核验其依赖闭包              |
+| `attestations`                                | Attestation[]                    | 签名证明，闭包节点至多一份且不得覆盖闭包外节点      |
+| `attestations[].node`                         | string（非空）                   | 被证明的节点名                                      |
+| `attestations[].fingerprint`                  | string（非空）                   | 签署时记录的节点指纹（须与重算值一致）              |
+| `attestations[].signer`                       | string（非空）                   | 签署者 ID，必须在 `trusted_keys` 中                 |
+| `attestations[].dependency_digests`           | object<string,string>            | 直接依赖名 → 该依赖的证明摘要，键须与直接依赖一致   |
+| `attestations[].signature`                    | string（Base64）                 | 对证明规范 UTF-8 字节的 Ed25519 签名（64 字节）     |
+| `trusted_keys`                                | object<string,string（Base64）>  | 受信签署者 ID → Ed25519 公钥（解码后 32 字节）      |
+
+响应字段：`trusted`（闭包内每个节点均通过时为 `true`）、`reasons`（未通过
+节点的原因列表，按节点名排序，每项含 `node` 与 `code`；`code` 取值为
+`missing_attestation` / `fingerprint_mismatch` / `dependency_mismatch` /
+`digest_mismatch` / `unknown_signer` / `invalid_signature`）。
+
 ## 本地开发与测试（不使用 Docker）
 
 需要 Python 3.11+：
@@ -1190,7 +1370,7 @@ uvicorn app.main:app --reload --port 8000
 pytest -q
 ```
 
-测试共 287 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
+测试共 330 项，覆盖指纹公式、缓存传播、批次划分、并行/不等待命中依赖、
 缺失依赖、环（含自环）、重名、顺序无关性、两图对比的根因识别、最短传导
 路径与字典序取舍、双图分别校验、缓存保留的最优选择与字典序平局取舍、
 候选上限与各类引用错误、执行事件回放的合法性与违规忽略、失败节点的
@@ -1202,4 +1382,7 @@ blocked 传递、重复 seq 与未知节点错误、失败隔离的最小成本�
 无解、闭包节点数与每节点制品数上限、闭包外制品与非法端点包等各类校验
 错误、发布条款的 bundled 闭包判定、build_only 边截断、缺失标签与互斥
 冲突的最短来源路径及字典序取舍、边类型逐一对应校验、重复标签与无效
-互斥对错误，以及全部 HTTP 状态码。
+互斥对错误、证明链的规范 JSON/摘要公式与非 ASCII 编码、逐节点指纹/依赖
+名/依赖摘要/签署者/签名核验与失败沿链传播、缺证明与顺序无关性、重复
+证明、闭包外证明、未知目标/证明节点、畸形 Base64 与非法公钥长度等
+错误，以及全部 HTTP 状态码。
