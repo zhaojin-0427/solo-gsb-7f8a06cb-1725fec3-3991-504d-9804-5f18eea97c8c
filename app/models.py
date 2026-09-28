@@ -563,3 +563,103 @@ class ReleasePolicyResponse(BaseModel):
             "sorted by pair."
         ),
     )
+
+
+# ----------------------------------------------------------- provenance verify
+
+
+class Attestation(BaseModel):
+    """A signed provenance attestation for a single build graph node."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    node: str = Field(
+        ..., min_length=1, description="Name of the attested graph node."
+    )
+    fingerprint: str = Field(
+        ..., min_length=1, description="Node fingerprint claimed by the signer."
+    )
+    signer: str = Field(
+        ..., min_length=1, description="ID of the signing entity (trusted key id)."
+    )
+    dependencies: dict[str, str] = Field(
+        ...,
+        description=(
+            "Direct dependency node name -> that dependency's attestation digest "
+            "(SHA-256 hex); keys must mirror the node's direct dependencies."
+        ),
+    )
+    signature: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Base64-encoded Ed25519 signature over the UTF-8 compact JSON bytes "
+            "of [node, fingerprint, signer, sorted([[dependency, digest], ...])]."
+        ),
+    )
+
+    @field_validator("dependencies")
+    @classmethod
+    def _validate_dependency_digests(cls, value: dict[str, str]) -> dict[str, str]:
+        for dep_name, digest in value.items():
+            if not isinstance(dep_name, str) or not dep_name.strip():
+                raise ValueError("dependency names must be non-empty strings")
+            if not isinstance(digest, str) or not digest.strip():
+                raise ValueError(
+                    "dependency attestation digests must be non-empty strings"
+                )
+        return value
+
+
+class ProvenanceVerifyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    nodes: list[Node] = Field(
+        ..., description="Build graph nodes (same schema as /plans)."
+    )
+    target: str = Field(
+        ..., min_length=1, description="Target node whose closure is verified."
+    )
+    attestations: list[Attestation] = Field(
+        ...,
+        description=(
+            "At most one attestation per closure node; attestations for nodes "
+            "outside the target closure are rejected."
+        ),
+    )
+    trusted_keys: dict[str, str] = Field(
+        ...,
+        description=(
+            "Signer id -> Base64-encoded raw Ed25519 public key (32 bytes) "
+            "trusted to sign attestations."
+        ),
+    )
+
+    @field_validator("trusted_keys")
+    @classmethod
+    def _validate_trusted_keys(cls, value: dict[str, str]) -> dict[str, str]:
+        for signer_id, key in value.items():
+            if not isinstance(signer_id, str) or not signer_id.strip():
+                raise ValueError("trusted key signer ids must be non-empty strings")
+            if not isinstance(key, str) or not key.strip():
+                raise ValueError("trusted public keys must be non-empty Base64 strings")
+        return value
+
+
+class ProvenanceVerifyResponse(BaseModel):
+    trusted: bool = Field(
+        ...,
+        description=(
+            "True only when every closure node has an attestation whose "
+            "fingerprint, dependency names/digests and Ed25519 signature verify."
+        ),
+    )
+    reasons: dict[str, list[str]] = Field(
+        ...,
+        description=(
+            "Per-closure-node failure reason codes, keyed and sorted by node "
+            "name; empty when trusted.  Possible codes: missing_attestation, "
+            "unknown_signer, fingerprint_mismatch, dependency_mismatch, "
+            "dependency_digest_mismatch, invalid_signature."
+        ),
+    )

@@ -20,6 +20,8 @@ from app.models import (
     ImpactResponse,
     PlanRequest,
     PlanResponse,
+    ProvenanceVerifyRequest,
+    ProvenanceVerifyResponse,
     ReleaseBundleRequest,
     ReleaseBundleResponse,
     ReleasePolicyRequest,
@@ -29,12 +31,13 @@ from app.models import (
 )
 from app.planner import PlanError, build_plan
 from app.policies import evaluate_release_policy
+from app.provenance import verify_provenance
 from app.retention import plan_cache_retention
 from app.transitions import plan_release_transitions
 
 app = FastAPI(
     title="Incremental Build Planner",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "Computes content-addressable fingerprints over a dependency graph "
         "and schedules cache-missing nodes into parallel build batches. "
@@ -46,9 +49,10 @@ app = FastAPI(
         "that no failed build node can reach a release target, picks "
         "the smallest dependency-consistent artifact bundle for a release, "
         "plans the minimum number of dependency-consistent artifact "
-        "switches that turn one release bundle into another, and evaluates "
+        "switches that turn one release bundle into another, evaluates "
         "organization clause tags over the bundled dependency closure to "
-        "decide whether a target may be released."
+        "decide whether a target may be released, and verifies Ed25519 "
+        "signed build-result provenance chains over a target closure."
     ),
 )
 
@@ -141,4 +145,16 @@ async def create_release_policy(
         request.labels,
         request.fulfilled,
         request.exclusive_pairs,
+    )
+
+
+@app.post("/provenance/verify", response_model=ProvenanceVerifyResponse)
+async def verify_build_provenance(
+    request: ProvenanceVerifyRequest,
+) -> ProvenanceVerifyResponse:
+    return verify_provenance(
+        request.nodes,
+        request.target,
+        request.attestations,
+        request.trusted_keys,
     )
